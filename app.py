@@ -1,32 +1,13 @@
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+import streamlit as st
 from src.helper import download_hugging_face_embeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import ChatOpenAI
-from langchain_classic.chains import create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
 from dotenv import load_dotenv
 from src.prompt import system_prompt
 import os
-from pathlib import Path
-
-app = FastAPI()
-BASE_DIR = Path(__file__).resolve().parent
-
-
-# Mount static files and templates
-app.mount(
-    "/static",
-    StaticFiles(directory=BASE_DIR / "static"),
-    name="static"
-)
-
-templates = Jinja2Templates(
-    directory=BASE_DIR / "templates"
-)
 
 load_dotenv()
 
@@ -36,45 +17,54 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-# Embeddings and vector store
-embeddings = download_hugging_face_embeddings()
-index_name = "medical-chatbot"
+st.set_page_config(page_title="Medical Chatbot", page_icon="🏥")
+st.title("🏥 Medical Chatbot")
+st.caption("Ask me anything about medical topics")
 
-docsearch = PineconeVectorStore.from_existing_index(
-    index_name=index_name,
-    embedding=embeddings
-)
-
-retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k": 3})
-
-# LLM and chain
-chatModel = ChatOpenAI(model="gpt-4o")
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system_prompt),
-        ("human", "{input}"),
-    ]
-)
-
-question_answer_chain = create_stuff_documents_chain(chatModel, prompt)
-rag_chain = create_retrieval_chain(retriever, question_answer_chain)
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse(
-        request=request,
-        name="chat.html",
-        context={}
+@st.cache_resource
+def load_chain():
+    embeddings = download_hugging_face_embeddings()
+    index_name = "medical-chatbot"
+    docsearch = PineconeVectorStore.from_existing_index(
+        index_name=index_name,
+        embedding=embeddings
+    )
+    retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+    chatModel = ChatOpenAI(model="gpt-4o")
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            ("human", "{input}"),
+        ]
     )
 
-@app.post("/get")
-async def chat(msg: str = Form(...)):
-    print(msg)
-    response = rag_chain.invoke({"input": msg})
-    print("Response:", response)
-    return response
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    chain = (
+        {"context": retriever | format_docs, "input": RunnablePassthrough()}
+        | prompt
+        | chatModel
+        | StrOutputParser()
+    )
+    return chain
+
+rag_chain = load_chain()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("Ask a medical question..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            response = rag_chain.invoke(prompt)
+            st.markdown(response)
+    st.session_state.messages.append({"role": "assistant", "content": response})
